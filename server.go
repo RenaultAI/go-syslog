@@ -241,12 +241,6 @@ func (s *Server) scan(scanCloser *ScanCloser, client string, tlsPeer string) {
 			return
 		case b := <-scanned:
 			if b {
-				// check in case scan took forever
-				select {
-				case <-s.stop:
-					return
-				default:
-				}
 				s.parser([]byte(scanCloser.Text()), client, tlsPeer)
 			} else {
 				return
