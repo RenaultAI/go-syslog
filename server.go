@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"crypto/tls"
 	"errors"
-	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -34,7 +33,6 @@ type Server struct {
 	connections             []net.PacketConn
 	wait                    sync.WaitGroup
 	stop                    chan struct{}
-	done                    chan struct{}
 	datagramChannel         chan DatagramMessage
 	format                  format.Format
 	handler                 Handler
@@ -46,7 +44,8 @@ type Server struct {
 
 //NewServer returns a new Server
 func NewServer() *Server {
-	return &Server{tlsPeerNameFunc: defaultTlsPeerName, datagramPool: sync.Pool{
+	stop := make(chan struct{})
+	return &Server{stop: stop, tlsPeerNameFunc: defaultTlsPeerName, datagramPool: sync.Pool{
 		New: func() interface{} {
 			return make([]byte, 65536)
 		},
@@ -129,8 +128,6 @@ func (s *Server) ListenTCP(addr string) error {
 		return err
 	}
 
-	s.stop = make(chan struct{})
-	s.done = make(chan struct{})
 	s.listeners = append(s.listeners, listener)
 	return nil
 }
@@ -142,8 +139,6 @@ func (s *Server) ListenTCPTLS(addr string, config *tls.Config) error {
 		return err
 	}
 
-	s.stop = make(chan struct{})
-	s.done = make(chan struct{})
 	s.listeners = append(s.listeners, listener)
 	return nil
 }
@@ -176,23 +171,20 @@ func (s *Server) Boot() error {
 func (s *Server) goAcceptConnection(listener net.Listener) {
 	s.wait.Add(1)
 	go func(listener net.Listener) {
-	loop:
+		defer s.wait.Done()
 		for {
 			select {
 			case <-s.stop:
-				fmt.Printf("stop accepting\n")
-				break loop
+				return
 			default:
-			}
-			connection, err := listener.Accept()
-			if err != nil {
-				continue
-			}
+				connection, err := listener.Accept()
+				if err != nil {
+					continue
+				}
 
-			s.goScanConnection(connection)
+				s.goScanConnection(connection)
+			}
 		}
-
-		s.wait.Done()
 	}(listener)
 }
 
@@ -232,6 +224,7 @@ func (s *Server) goScanConnection(connection net.Conn) {
 	go s.scan(scanCloser, client, tlsPeer)
 }
 
+
 func (s *Server) scan(scanCloser *ScanCloser, client string, tlsPeer string) {
 	defer s.wait.Done()
 	defer scanCloser.closer.Close()
@@ -239,17 +232,25 @@ func (s *Server) scan(scanCloser *ScanCloser, client string, tlsPeer string) {
 		if s.readTimeoutMilliseconds > 0 {
 			scanCloser.closer.SetReadDeadline(time.Now().Add(time.Duration(s.readTimeoutMilliseconds) * time.Millisecond))
 		}
-		if scanCloser.Scan() {
-			// check in case scan took forever
-			select {
-			case <-s.stop:
-				fmt.Printf("stop scanning\n")
-				return
-			default:
-			}
-			s.parser([]byte(scanCloser.Text()), client, tlsPeer)
-		} else {
+		// we do the scan in a go func so we can listen to it finishing, along with our stop chan
+		// at the same time
+		scanned := make(chan bool)
+		go func() { scanned <- scanCloser.Scan() }()
+		select {
+		case <-s.stop:
 			return
+		case b := <-scanned:
+			if b {
+				// check in case scan took forever
+				select {
+				case <-s.stop:
+					return
+				default:
+				}
+				s.parser([]byte(scanCloser.Text()), client, tlsPeer)
+			} else {
+				return
+			}
 		}
 	}
 
@@ -300,16 +301,10 @@ func (s *Server) Kill() error {
 	s.listeners = []net.Listener{}
 
 	// Only need to close channel once to broadcast to all waiting
-	fmt.Printf("stop: %+v\n", s.stop)
-	if s.stop != nil {
-		fmt.Printf("close stop\n")
-		close(s.stop)
-	}
+	close(s.stop)
 
 	// Wait until receivers have acknowledged before tearing down the rest
-	fmt.Printf("wait\n")
-	<-s.done
-	fmt.Printf("done waiting\n")
+	s.Wait()
 
 	if s.datagramChannel != nil {
 		close(s.datagramChannel)
@@ -344,8 +339,6 @@ func (s *Server) goReceiveDatagrams(packetconn net.PacketConn) {
 		for {
 			select {
 			case <-s.stop:
-				fmt.Printf("stop receiving\n")
-				close(s.done)
 				return
 			default:
 			}
@@ -385,6 +378,8 @@ func (s *Server) goParseDatagrams() {
 		defer s.wait.Done()
 		for {
 			select {
+			// TODO verify that datagramChannel is never closed before stop has been closed
+			// we very well might be able to "assume" we'll never get a closed-channel-value here
 			case msg, ok := (<-s.datagramChannel):
 				if !ok {
 					return
@@ -397,6 +392,8 @@ func (s *Server) goParseDatagrams() {
 					s.parser(msg.message, msg.client, "")
 				}
 				s.datagramPool.Put(msg.message[:cap(msg.message)])
+			case <-s.stop:
+				return
 			}
 		}
 	}()
